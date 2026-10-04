@@ -1,8 +1,13 @@
 // solver for Zachtronics Cribbage Solitaire:
 // https://zachtronics.com/solitaire-rules/#logo-cheyenne
 
+use std::array;
 use std::mem::swap;
 use std::range::Range;
+
+use fearless_simd::prelude::*;
+use fearless_simd::{Level, Simd, dispatch, i16x8, u16x8, u64x2};
+use fearless_simd_macros::simd;
 
 #[inline(always)]
 fn nibble_at(within: impl Into<u64>, n: impl Into<u32>) -> u8 {
@@ -28,29 +33,49 @@ impl Stack {
         nibble_at(SCORES, matched.trailing_zeros() / 4)
     }
 
-    fn score_run(self) -> u8 {
-        let mask_at = |n| 1u16 << nibble_at(self.0, n);
-        let mut best = 0;
-        let mut mask = mask_at(0) | mask_at(1);
-        for n in 2..=6 {
-            mask |= mask_at(n);
-            // remove the bit representing 0
-            let a = mask >> 1;
-            // isolate the least-significant set bit: there definitely is one
-            // because this is never called on an empty stack
-            let min_bit = a.isolate_lowest_one();
-            // collapse the least-significant run upward, leaving the next higher
-            // bit set; can't overflow because there's always at least one clear
-            // bit due to the above shift
-            let b = a + min_bit;
-            // if there was exactly one run of n bits set, then that run is now
-            // collapsed to a single bit n bits above min_bit
-            let n = n + 1;
-            if min_bit << n == b {
-                best = n;
+    #[simd]
+    fn score_run_simd<S: Simd>(self, simd: S) -> u8 {
+        let masks = match simd.level() {
+            // with SSE4.2 or newer there are reasonable implementations of
+            // variable left-shift, so it's worth doing the steps before that
+            // with vector instructions too
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            level if level.as_sse4_2().is_some() => {
+                // zero-extend packed 4-bit values to 16-bit. this discards the
+                // upper half of the stack but that's okay because we only need
+                // to score the most recent 7 cards
+                let nibbles = u64x2::simd_from(simd, [self.0, 0]).to_bytes();
+                let bytes = nibbles.zip_low(nibbles >> 4);
+                let words = bytes.widen().0;
+                let stack = words & 0xF;
+                // turn card ranks into bitmasks with the nth bit set
+                u16x8::splat(simd, 1) << stack
             }
-        }
-        best
+            // on other targets, do the shifts in scalar registers first
+            _ => u16x8::simd_from(simd, array::from_fn(|i| 1 << nibble_at(self.0, i as u8))),
+        };
+        // remove the bit representing 0
+        let masks = masks >> 1;
+        // accumulate masks so each has all the bits from newer cards
+        let masks = masks | masks.shift_elements_right::<1>(0);
+        let masks = masks | masks.shift_elements_right::<2>(0);
+        let masks = masks | masks.shift_elements_right::<4>(0);
+        // isolate the least-significant set bit: there definitely is one
+        // because this is never called on an empty stack
+        let masks = masks.bitcast::<i16x8<S>>();
+        let min_bits = masks & -masks;
+        // collapse the least-significant run upward, leaving the next higher
+        // bit set; can't overflow because there's always at least one clear bit
+        // due to the above shift
+        let collapsed = masks + min_bits;
+        // if there was exactly one run of n bits set, then that run is now
+        // collapsed to a single bit n bits above min_bit. we only want to score
+        // runs of length 3 through 7, so don't shift the other lanes: that
+        // guarantees they can't match with the mask which had the min-bit set.
+        let expected = min_bits << i16x8::simd_from(simd, [0, 0, 3, 4, 5, 6, 7, 0]);
+        let matched = collapsed.simd_eq(expected).to_bitmask();
+        // score based on the highest-numbered lane which matched, if any
+        matched.highest_one().map_or(0, |x| (x + 1) as _)
     }
 }
 
@@ -92,7 +117,7 @@ impl Position {
         self.score += self.score_total();
         self.score += self.stack.score_first_jack();
         self.score += self.stack.score_repeats();
-        self.score += self.stack.score_run();
+        self.score += dispatch!(Level::new(), simd => self.stack.score_run_simd(simd));
         Some(self)
     }
 
@@ -139,7 +164,7 @@ impl Default for StackCache {
             todo: Vec::new(),
             next: Vec::new(),
             done: Vec::new(),
-            cache_ranges: Box::new(std::array::repeat((0..0).into())),
+            cache_ranges: Box::new(array::repeat((0..0).into())),
             cache: Vec::new(),
         }
     }
