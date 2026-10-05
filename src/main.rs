@@ -132,17 +132,11 @@ impl Position {
         if self.total & 0xF == 0xF { 2 } else { 0 }
     }
 
-    fn play_card(mut self, card: u8) -> Option<Self> {
-        self.total += card.min(10);
-        if self.total > 31 {
-            return None;
-        }
-        self.stack.push(card);
+    fn update_score(&mut self) {
         self.score += self.score_total();
         self.score += self.stack.score_first_jack();
         self.score += self.stack.score_repeats();
         self.score += dispatch!(Level::new(), simd => self.stack.score_run_simd(simd));
-        Some(self)
     }
 
     fn move_from(mut self, initial: &InitialTableaux, column: u8) -> Option<Self> {
@@ -150,11 +144,15 @@ impl Position {
         let offset = nibble_at(self.tableaux.0, column);
         if offset == 0xF {
             // underflow, no cards left in this column
-            None
-        } else {
-            let card = nibble_at(initial.0[usize::from(column)], offset);
-            self.play_card(card)
+            return None;
         }
+        let card = nibble_at(initial.0[usize::from(column)], offset);
+        self.total += card.min(10);
+        if self.total > 31 {
+            return None;
+        }
+        self.stack.push(card);
+        Some(self)
     }
 }
 
@@ -221,6 +219,9 @@ impl StackCache {
             }
             self.todo.sort_unstable();
             self.todo.dedup();
+            for position in self.todo.iter_mut() {
+                position.update_score();
+            }
         }
 
         // try the highest scores first, but in case of ties, try the smallest
