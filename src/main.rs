@@ -132,11 +132,11 @@ impl Position {
         if self.total & 0xF == 0xF { 2 } else { 0 }
     }
 
-    fn update_score(&mut self) {
+    fn update_score(&mut self, level: Level) {
         self.score += self.score_total();
         self.score += self.stack.score_first_jack();
         self.score += self.stack.score_repeats();
-        self.score += dispatch!(Level::new(), simd => self.stack.score_run_simd(simd));
+        self.score += dispatch!(level, simd => self.stack.score_run_simd(simd));
     }
 
     fn move_from(mut self, initial: &InitialTableaux, column: u8) -> Option<Self> {
@@ -194,6 +194,7 @@ impl Default for StackCache {
 
 impl StackCache {
     fn uncached(&mut self, initial: &InitialTableaux, tableaux: Tableaux) {
+        let level = Level::new();
         self.todo.push(Position {
             tableaux,
             stack: Stack::default(),
@@ -220,7 +221,7 @@ impl StackCache {
             self.todo.sort_unstable();
             self.todo.dedup();
             for position in self.todo.iter_mut() {
-                position.update_score();
+                position.update_score(level);
             }
         }
 
