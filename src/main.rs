@@ -2,7 +2,6 @@
 // https://zachtronics.com/solitaire-rules/#logo-cheyenne
 
 use std::array;
-use std::mem::swap;
 use std::range::Range;
 
 use fearless_simd::prelude::*;
@@ -177,20 +176,20 @@ struct BestStack {
 
 struct StackCache {
     todo: Vec<Position>,
-    next: Vec<Position>,
     done: Vec<Position>,
     cache_ranges: Box<[Range<u32>; 65536]>,
     cache: Vec<BestStack>,
+    unique: u16,
 }
 
 impl Default for StackCache {
     fn default() -> Self {
         Self {
             todo: Vec::new(),
-            next: Vec::new(),
             done: Vec::new(),
             cache_ranges: Box::new(array::repeat((0..0).into())),
             cache: Vec::new(),
+            unique: 0,
         }
     }
 }
@@ -204,11 +203,12 @@ impl StackCache {
             score: 0,
         });
         while !self.todo.is_empty() {
-            for position in self.todo.drain(..) {
-                let past = self.next.len();
-                self.next
+            for i in (0..self.todo.len()).rev() {
+                let position = self.todo.swap_remove(i);
+                let past = self.todo.len();
+                self.todo
                     .extend((0..4).filter_map(|column| position.move_from(initial, column)));
-                if past == self.next.len() {
+                if past == self.todo.len() {
                     match self.done.last_mut() {
                         Some(prev) if position.tableaux == prev.tableaux => {
                             if position.score > prev.score {
@@ -219,7 +219,6 @@ impl StackCache {
                     }
                 }
             }
-            swap(&mut self.todo, &mut self.next);
             self.todo.sort_unstable();
             self.todo.dedup();
         }
@@ -235,6 +234,7 @@ impl StackCache {
         let mut range = self.cache_ranges[usize::from(tableaux.0)];
         if range.start == range.end {
             self.uncached(initial, tableaux);
+            self.unique += 1;
             //eprintln!("({:x},{:?})", tableaux.0, self.done);
 
             range.start = self.cache.len().try_into().unwrap();
@@ -282,6 +282,7 @@ impl SearchState {
         let mut edges = 0;
         let mut leaves = 0;
         let mut todo = vec![Tableaux::new(&self.initial)];
+        let mut max_todo = todo.len();
         while let Some(cur) = todo.pop() {
             let cur_best = self.best[usize::from(cur.0)].score;
             for next in self.stacks.cached(&self.initial, cur) {
@@ -301,9 +302,18 @@ impl SearchState {
                     edges += 1;
                 }
             }
+            max_todo = todo.len().max(max_todo);
         }
         eprintln!(
-            "searched {leaves} solutions, {} edges {edges} times ({}x)",
+            "allocated capacity: todo {}/{}, stacks.todo {}, stacks.done {}",
+            max_todo,
+            todo.capacity(),
+            self.stacks.todo.capacity(),
+            self.stacks.done.capacity()
+        );
+        eprintln!(
+            "searched {leaves} solutions, {} nodes, {} edges {edges} times ({}x)",
+            self.stacks.unique,
             self.stacks.cache.len(),
             edges as f64 / self.stacks.cache.len() as f64
         );
