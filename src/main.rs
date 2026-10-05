@@ -6,7 +6,7 @@ use std::mem::swap;
 use std::range::Range;
 
 use fearless_simd::prelude::*;
-use fearless_simd::{Level, Simd, dispatch, i16x8, u16x8, u64x2};
+use fearless_simd::{Level, Simd, dispatch, i16x8, u8x16, u16x8, u64x2};
 use fearless_simd_macros::simd;
 
 #[inline(always)]
@@ -35,27 +35,48 @@ impl Stack {
 
     #[simd]
     fn score_run_simd<S: Simd>(self, simd: S) -> u8 {
+        // turn card ranks into bitmasks, where rank N sets bit N-1, and an
+        // absent card (rank 0) doesn't set any bits. conceptually, this is a
+        // left-shift of a constant by a variable number of bits, followed by a
+        // right-shift by 1 bit.
+        //
+        // LLVM and fearless-simd pull off an impressive variety of tricks if we
+        // ask for that: AVX512 has an instruction for it; on SSE4.2 it adds the
+        // shift amount to the exponent field in 1.0xf32 and converts that to
+        // an int; AVX2 did some magic I didn't understand. but there are only
+        // 16 possible outputs, which is easy to turn into a small lookup table,
+        // and those three instruction sets also have reasonable support for
+        // swizzles which can be used as table lookup.
+        //
+        // however, baseline x86-64 (SSE) doesn't do either swizzles or variable
+        // shifts. if we put the stack into a vector but then fall back to
+        // per-lane scalar operations, the resulting code is, uh, bad. so just
+        // do everything preceding the variable shift as scalar ops to begin
+        // with.
+        //
+        // while the card ranks are packed into 4 bits each, the corresponding
+        // bitmask needs to be 16 bits wide. the most portable vector length is
+        // 128 bits, which only has room for 8 bitmasks. fortunately, we only
+        // need to score the most recent 7 cards.
         let masks = match simd.level() {
-            // with SSE4.2 or newer there are reasonable implementations of
-            // variable left-shift, so it's worth doing the steps before that
-            // with vector instructions too
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             level if level.as_sse4_2().is_some() => {
-                // zero-extend packed 4-bit values to 16-bit. this discards the
-                // upper half of the stack but that's okay because we only need
-                // to score the most recent 7 cards
+                // zero-extend packed 4-bit values to 8-bit
                 let nibbles = u64x2::simd_from(simd, [self.0, 0]).to_bytes();
-                let bytes = nibbles.zip_low(nibbles >> 4);
-                let words = bytes.widen().0;
-                let stack = words & 0xF;
-                // turn card ranks into bitmasks with the nth bit set
-                u16x8::splat(simd, 1) << stack
+                let bytes = nibbles.zip_low(nibbles >> 4) & 0xF;
+                // create lookup tables of shift results
+                let shifts = array::from_fn(|i| (1u16 << i) >> 1);
+                let shifts_lo = shifts.map(|n| n as u8);
+                let shifts_hi = shifts.map(|n| (n >> 8) as u8);
+                // look up each card rank in the tables
+                let bytes_lo = u8x16::simd_from(simd, shifts_lo).swizzle_dyn(bytes);
+                let bytes_hi = u8x16::simd_from(simd, shifts_hi).swizzle_dyn(bytes);
+                u16x8::from_bytes(bytes_lo.zip_low(bytes_hi))
             }
             // on other targets, do the shifts in scalar registers first
-            _ => u16x8::simd_from(simd, array::from_fn(|i| 1 << nibble_at(self.0, i as u8))),
+            _ => u16x8::from_fn(simd, |i| 1 << nibble_at(self.0, i as u8)) >> 1,
         };
-        // remove the bit representing 0
-        let masks = masks >> 1;
+
         // accumulate masks so each has all the bits from newer cards
         let masks = masks | masks.shift_elements_right::<1>(0);
         let masks = masks | masks.shift_elements_right::<2>(0);
@@ -66,13 +87,17 @@ impl Stack {
         let min_bits = masks & -masks;
         // collapse the least-significant run upward, leaving the next higher
         // bit set; can't overflow because there's always at least one clear bit
-        // due to the above shift
         let collapsed = masks + min_bits;
         // if there was exactly one run of n bits set, then that run is now
-        // collapsed to a single bit n bits above min_bit. we only want to score
-        // runs of length 3 through 7, so don't shift the other lanes: that
-        // guarantees they can't match with the mask which had the min-bit set.
-        let expected = min_bits << i16x8::simd_from(simd, [0, 0, 3, 4, 5, 6, 7, 0]);
+        // collapsed to a single bit n bits above min_bit. we only want to
+        // score runs of length 3 through 7, so don't shift the other lanes:
+        // that guarantees they can't match with the mask which had the min-bit
+        // set. (this is conceptually another variable left-shift, but because
+        // the shift amount in each lane is constant, we can transform it to
+        // multiplication by a constant vector instead. on AVX512, LLVM actually
+        // transforms this back to a variable shift, but multiplication is
+        // widely available and a safe bet otherwise.)
+        let expected = min_bits * i16x8::simd_from(simd, [0, 0, 3, 4, 5, 6, 7, 0].map(|i| 1 << i));
         let matched = collapsed.simd_eq(expected).to_bitmask();
         // score based on the highest-numbered lane which matched, if any
         matched.highest_one().map_or(0, |x| (x + 1) as _)
