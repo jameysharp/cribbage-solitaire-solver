@@ -145,6 +145,7 @@ impl Position {
         if self.total & 0xF == 0xF { 2 } else { 0 }
     }
 
+    #[inline]
     fn update_score(&mut self, level: Level) {
         self.score += self.score_total();
         self.score += self.stack.score_first_jack();
