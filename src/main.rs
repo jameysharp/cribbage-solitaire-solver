@@ -2,7 +2,6 @@
 // https://zachtronics.com/solitaire-rules/#logo-cheyenne
 
 use std::array;
-use std::cmp::Ordering;
 use std::range::Range;
 
 use fearless_simd::prelude::*;
@@ -198,39 +197,32 @@ impl Default for StackCache {
     }
 }
 
-fn merge_dedup(
-    mut iter_a: impl Iterator<Item = Position>,
-    mut iter_b: impl Iterator<Item = Position>,
+fn merge_many_dedup(
+    iter: impl Iterator<Item = impl Iterator<Item = Position>>,
 ) -> impl Iterator<Item = Position> {
-    let mut next_a = iter_a.next();
-    let mut next_b = iter_b.next();
-    std::iter::from_fn(move || match (next_a.take(), next_b.take()) {
-        (Some(a), Some(b)) => match a.tableaux.cmp(&b.tableaux).then(a.stack.cmp(&b.stack)) {
-            Ordering::Equal => {
-                next_a = iter_a.next();
-                next_b = iter_b.next();
-                Some(a)
+    let mut nexts = Vec::from_iter(iter.filter_map(|mut iter| Some((iter.next()?, iter))));
+    std::iter::from_fn(move || {
+        let (next_idx, _) = nexts
+            .iter()
+            .enumerate()
+            .min_by(|(_, (a, _)), (_, (b, _))| {
+                a.tableaux.cmp(&b.tableaux).then(a.stack.cmp(&b.stack))
+            })?;
+        let mut next = nexts.swap_remove(next_idx);
+        nexts.retain_mut(|other| {
+            if next.0.tableaux != other.0.tableaux || next.0.stack != other.0.stack {
+                true
+            } else if let Some(future) = other.1.next() {
+                other.0 = future;
+                true
+            } else {
+                false
             }
-            Ordering::Less => {
-                next_a = iter_a.next();
-                next_b = Some(b);
-                Some(a)
-            }
-            Ordering::Greater => {
-                next_a = Some(a);
-                next_b = iter_b.next();
-                Some(b)
-            }
-        },
-        (Some(a), None) => {
-            next_a = iter_a.next();
-            Some(a)
+        });
+        if let Some(future) = next.1.next() {
+            nexts.push((future, next.1));
         }
-        (None, Some(b)) => {
-            next_b = iter_b.next();
-            Some(b)
-        }
-        (None, None) => None,
+        Some(next.0)
     })
 }
 
@@ -265,16 +257,12 @@ impl StackCache {
             // tableaux, and inserts a nibble at the bottom of stack. so if we
             // generate moves for each column separately, we have four sorted
             // lists, which can be merged and deduplicated in linear time.
-            let next_for = |column| {
-                self.todo
-                    .iter()
-                    .filter_map(move |position| position.move_from(initial, column))
-            };
             self.next.extend(
-                merge_dedup(
-                    merge_dedup(next_for(3), next_for(2)),
-                    merge_dedup(next_for(1), next_for(0)),
-                )
+                merge_many_dedup((0..4).map(|column| {
+                    self.todo
+                        .iter()
+                        .filter_map(move |position| position.move_from(initial, column))
+                }))
                 .map(|mut position| {
                     position.update_score(level);
                     position
