@@ -16,6 +16,12 @@ fn nibble_at(within: impl Into<u64>, n: impl Into<u32>) -> u8 {
 #[derive(Clone, Copy, Default, Eq, Ord, PartialEq, PartialOrd)]
 struct Stack(u64);
 
+impl std::fmt::Debug for Stack {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{:x}", self.0)
+    }
+}
+
 impl Stack {
     fn push(&mut self, card: u8) {
         self.0 = self.0 << 4 | card as u64;
@@ -108,6 +114,12 @@ struct InitialTableaux([u64; 4]);
 #[derive(Clone, Copy, Default, Eq, Ord, PartialEq, PartialOrd)]
 struct Tableaux(u16);
 
+impl std::fmt::Debug for Tableaux {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{:04x}", self.0)
+    }
+}
+
 impl Tableaux {
     fn new(initial: &InitialTableaux) -> Tableaux {
         let mut tableaux = 0;
@@ -119,7 +131,7 @@ impl Tableaux {
     }
 }
 
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 struct Position {
     tableaux: Tableaux,
     stack: Stack,
@@ -153,16 +165,6 @@ impl Position {
         }
         self.stack.push(card);
         Some(self)
-    }
-}
-
-impl std::fmt::Debug for Position {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "Position {{ tableaux: {:x}, stack: {:x}, total: {}, score: {} }}",
-            self.tableaux.0, self.stack.0, self.total, self.score
-        )
     }
 }
 
