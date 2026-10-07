@@ -131,7 +131,7 @@ impl Tableaux {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Default)]
 struct Position {
     tableaux: Tableaux,
     stack: Stack,
@@ -199,9 +199,7 @@ impl StackCache {
         let level = Level::new();
         self.todo.push(Position {
             tableaux,
-            stack: Stack::default(),
-            total: 0,
-            score: 0,
+            ..Position::default()
         });
         while !self.todo.is_empty() {
             for i in (0..self.todo.len()).rev() {
@@ -220,8 +218,8 @@ impl StackCache {
                     }
                 }
             }
-            self.todo.sort_unstable();
-            self.todo.dedup();
+            self.todo.sort_unstable_by_key(|p| (p.tableaux, p.stack));
+            self.todo.dedup_by_key(|p| (p.tableaux, p.stack));
             for position in self.todo.iter_mut() {
                 position.update_score(level);
             }

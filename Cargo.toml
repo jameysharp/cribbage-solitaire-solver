@@ -3,6 +3,9 @@ name = "zach-cribbage"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+debug = true
+
 [dependencies]
 fearless_simd = "1.0.0"
 fearless_simd_macros = "0.1.0"
