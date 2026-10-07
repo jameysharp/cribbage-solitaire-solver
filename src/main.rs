@@ -2,6 +2,7 @@
 // https://zachtronics.com/solitaire-rules/#logo-cheyenne
 
 use std::array;
+use std::cmp::Ordering;
 use std::range::Range;
 
 use fearless_simd::prelude::*;
@@ -176,6 +177,7 @@ struct BestStack {
 
 struct StackCache {
     todo: Vec<Position>,
+    next: Vec<Position>,
     done: Vec<Position>,
     cache_ranges: Box<[Range<u32>; 65536]>,
     cache: Vec<BestStack>,
@@ -186,12 +188,66 @@ impl Default for StackCache {
     fn default() -> Self {
         Self {
             todo: Vec::new(),
+            next: Vec::new(),
             done: Vec::new(),
             cache_ranges: Box::new(array::repeat((0..0).into())),
             cache: Vec::new(),
             unique: 0,
         }
     }
+}
+
+fn merge_dedup(
+    mut iter_a: impl Iterator<Item = Position>,
+    mut iter_b: impl Iterator<Item = Position>,
+) -> impl Iterator<Item = Position> {
+    let mut next_a = iter_a.next();
+    let mut next_b = iter_b.next();
+    std::iter::from_fn(move || match (next_a.take(), next_b.take()) {
+        (Some(a), Some(b)) => match a.tableaux.cmp(&b.tableaux).then(a.stack.cmp(&b.stack)) {
+            Ordering::Equal => {
+                next_a = iter_a.next();
+                next_b = iter_b.next();
+                Some(a)
+            }
+            Ordering::Less => {
+                next_a = iter_a.next();
+                next_b = Some(b);
+                Some(a)
+            }
+            Ordering::Greater => {
+                next_a = Some(a);
+                next_b = iter_b.next();
+                Some(b)
+            }
+        },
+        (Some(a), None) => {
+            next_a = iter_a.next();
+            Some(a)
+        }
+        (None, Some(b)) => {
+            next_b = iter_b.next();
+            Some(b)
+        }
+        (None, None) => None,
+    })
+}
+
+fn best_dedup(mut iter: impl Iterator<Item = Position>) -> impl Iterator<Item = Position> {
+    let mut next = iter.next();
+    std::iter::from_fn(move || {
+        let mut a = next.take()?;
+        while let Some(b) = iter.next() {
+            if a.tableaux != b.tableaux {
+                next = Some(b);
+                break;
+            }
+            if a.score < b.score {
+                a = b;
+            }
+        }
+        Some(a)
+    })
 }
 
 impl StackCache {
@@ -202,27 +258,34 @@ impl StackCache {
             ..Position::default()
         });
         while !self.todo.is_empty() {
-            for i in (0..self.todo.len()).rev() {
-                let position = self.todo.swap_remove(i);
-                let past = self.todo.len();
+            // we're keeping self.todo sorted and unique by tableaux then stack.
+            // move_from preserves that sort order and uniqueness if given
+            // the same column number every time: it subtracts a constant from
+            // tableaux, and inserts a nibble at the bottom of stack. so if we
+            // generate moves for each column separately, we have four sorted
+            // lists, which can be merged and deduplicated in linear time.
+            let next_for = |column| {
                 self.todo
-                    .extend((0..4).filter_map(|column| position.move_from(initial, column)));
-                if past == self.todo.len() {
-                    match self.done.last_mut() {
-                        Some(prev) if position.tableaux == prev.tableaux => {
-                            if position.score > prev.score {
-                                *prev = position;
-                            }
-                        }
-                        _ => self.done.push(position),
-                    }
-                }
-            }
-            self.todo.sort_unstable_by_key(|p| (p.tableaux, p.stack));
-            self.todo.dedup_by_key(|p| (p.tableaux, p.stack));
-            for position in self.todo.iter_mut() {
-                position.update_score(level);
-            }
+                    .iter()
+                    .filter_map(move |position| position.move_from(initial, column))
+            };
+            self.next.extend(
+                merge_dedup(
+                    merge_dedup(next_for(3), next_for(2)),
+                    merge_dedup(next_for(1), next_for(0)),
+                )
+                .map(|mut position| {
+                    position.update_score(level);
+                    position
+                }),
+            );
+
+            self.done
+                .extend(best_dedup(self.todo.drain(..).filter(|position| {
+                    (0..4).all(|column| position.move_from(initial, column).is_none())
+                })));
+
+            std::mem::swap(&mut self.todo, &mut self.next);
         }
 
         // try the highest scores first, but in case of ties, try the smallest
@@ -307,10 +370,11 @@ impl SearchState {
             max_todo = todo.len().max(max_todo);
         }
         eprintln!(
-            "allocated capacity: todo {}/{}, stacks.todo {}, stacks.done {}",
+            "allocated capacity: todo {}/{}, stacks.todo {}, stacks.next {}, stacks.done {}",
             max_todo,
             todo.capacity(),
             self.stacks.todo.capacity(),
+            self.stacks.next.capacity(),
             self.stacks.done.capacity()
         );
         eprintln!(
