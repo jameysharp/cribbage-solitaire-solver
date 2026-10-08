@@ -154,12 +154,12 @@ impl Position {
     }
 
     fn move_from(mut self, initial: &InitialTableaux, column: u8) -> Option<Self> {
-        self.tableaux.0 = self.tableaux.0.wrapping_sub(1 << column * 4);
-        let offset = nibble_at(self.tableaux.0, column);
-        if offset == 0xF {
+        if nibble_at(self.tableaux.0, column) == 0 {
             // underflow, no cards left in this column
             return None;
         }
+        self.tableaux.0 = self.tableaux.0.wrapping_sub(1 << column * 4);
+        let offset = nibble_at(self.tableaux.0, column);
         let card = nibble_at(initial.0[usize::from(column)], offset);
         self.total += card.min(10);
         if self.total > 31 {
