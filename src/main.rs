@@ -2,6 +2,7 @@
 // https://zachtronics.com/solitaire-rules/#logo-cheyenne
 
 use std::array;
+use std::cmp::Ordering;
 use std::range::Range;
 
 use fearless_simd::prelude::*;
@@ -197,35 +198,6 @@ impl Default for StackCache {
     }
 }
 
-fn merge_many_dedup(
-    iter: impl Iterator<Item = impl Iterator<Item = Position>>,
-) -> impl Iterator<Item = Position> {
-    let mut nexts = Vec::from_iter(iter.filter_map(|mut iter| Some((iter.next()?, iter))));
-    std::iter::from_fn(move || {
-        let (next_idx, _) = nexts
-            .iter()
-            .enumerate()
-            .min_by(|(_, (a, _)), (_, (b, _))| {
-                a.tableaux.cmp(&b.tableaux).then(a.stack.cmp(&b.stack))
-            })?;
-        let mut next = nexts.swap_remove(next_idx);
-        nexts.retain_mut(|other| {
-            if next.0.tableaux != other.0.tableaux || next.0.stack != other.0.stack {
-                true
-            } else if let Some(future) = other.1.next() {
-                other.0 = future;
-                true
-            } else {
-                false
-            }
-        });
-        if let Some(future) = next.1.next() {
-            nexts.push((future, next.1));
-        }
-        Some(next.0)
-    })
-}
-
 fn best_dedup(mut iter: impl Iterator<Item = Position>) -> impl Iterator<Item = Position> {
     let mut next = iter.next();
     std::iter::from_fn(move || {
@@ -257,17 +229,42 @@ impl StackCache {
             // tableaux, and inserts a nibble at the bottom of stack. so if we
             // generate moves for each column separately, we have four sorted
             // lists, which can be merged and deduplicated in linear time.
-            self.next.extend(
-                merge_many_dedup((0..4).map(|column| {
-                    self.todo
-                        .iter()
-                        .filter_map(move |position| position.move_from(initial, column))
-                }))
-                .map(|mut position| {
-                    position.update_score(level);
-                    position
-                }),
-            );
+            let mut nexts: [_; 4] = std::array::from_fn(|_| self.todo.iter());
+            self.next.extend(std::iter::from_fn(move || {
+                let key = |position: Position| (position.tableaux, position.stack);
+                let mut min = Position::default();
+                let mut min_idx = None;
+                // in one visit to each column, find the minimum legal move
+                // and, at the same time, deduplicate moves
+                for (column, idx) in nexts.iter_mut().enumerate() {
+                    while let Some(position) = idx.as_slice().first() {
+                        // recompute move_from every time, it's cheap
+                        if let Some(next) = position.move_from(initial, column as u8) {
+                            match (&min_idx, key(next).cmp(&key(min))) {
+                                (None, _) | (_, Ordering::Less) => {
+                                    min = next;
+                                    min_idx = Some(idx);
+                                }
+                                // it doesn't matter if the current min
+                                // doesn't turn out to be the final min; if
+                                // there are two equal positions we'll want
+                                // to get rid of one sooner or later
+                                (_, Ordering::Equal) => {
+                                    idx.next();
+                                }
+                                (_, Ordering::Greater) => {}
+                            }
+                            break;
+                        }
+                        // no move from this position in this column, skip
+                        idx.next();
+                    }
+                }
+                // if we found any move, return it but skip it next time
+                min_idx?.next();
+                min.update_score(level);
+                Some(min)
+            }));
 
             self.done
                 .extend(best_dedup(self.todo.drain(..).filter(|position| {
