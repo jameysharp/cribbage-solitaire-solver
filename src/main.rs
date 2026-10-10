@@ -125,7 +125,7 @@ impl Tableaux {
     fn new(initial: &InitialTableaux) -> Tableaux {
         let mut tableaux = 0;
         for (column, contents) in initial.0.iter().enumerate() {
-            let height = (64 - contents.leading_zeros() as u16) / 4;
+            let height = 16 - contents.leading_zeros() as u16 / 4;
             tableaux |= height << column * 4;
         }
         Tableaux(tableaux)
