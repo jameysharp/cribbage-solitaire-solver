@@ -3,11 +3,90 @@
 
 use std::array;
 use std::cmp::Ordering;
+use std::fmt::Write;
 use std::range::Range;
 
 use fearless_simd::prelude::*;
 use fearless_simd::{Level, Simd, dispatch, i16x8, u8x16, u16x8, u64x2};
 use fearless_simd_macros::simd;
+
+#[derive(Debug)]
+struct InitialTableaux([u64; 4]);
+
+impl std::str::FromStr for InitialTableaux {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let push = |pile: &mut u64, card| {
+            *pile >>= 4;
+            *pile |= (card as u64) << 60;
+        };
+        let finish = |pile: &mut u64| {
+            let empty = pile.trailing_zeros() / 4;
+            *pile >>= empty * 4;
+            if empty < 3 {
+                Err("too many cards in pile")
+            } else {
+                Ok(())
+            }
+        };
+        let mut result = [0; _];
+        let (mut pile, mut rest) = result.split_first_mut().unwrap();
+        for c in s.chars() {
+            match c {
+                '_' => {
+                    finish(pile)?;
+                    if let Some((new_pile, new_rest)) = rest.split_first_mut() {
+                        pile = new_pile;
+                        rest = new_rest;
+                    } else {
+                        return Err("too many columns");
+                    }
+                }
+                'A' | 'a' => push(pile, 1),
+                '1'..='9' => push(pile, c.to_digit(10).unwrap()),
+                'T' | 't' | '0' => push(pile, 10),
+                'J' | 'j' => push(pile, 11),
+                'Q' | 'q' => push(pile, 12),
+                'K' | 'k' => push(pile, 13),
+                _ => return Err("invalid card"),
+            }
+        }
+        finish(pile)?;
+        if !rest.is_empty() {
+            return Err("not enough columns");
+        }
+        Ok(InitialTableaux(result))
+    }
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+struct Moves(u32);
+
+impl std::fmt::Debug for Moves {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let (width, fill) = if let Some(width) = f.width() {
+            (width, '1')
+        } else {
+            (13, '?')
+        };
+        for i in (0..width).rev() {
+            let prefix = self.0 >> (i * 2);
+            if prefix == 0 {
+                f.write_char(fill)?;
+            } else {
+                f.write_char(char::from_digit(1 + (prefix & 3), 10).unwrap())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Moves {
+    fn push(&mut self, column: u8) {
+        self.0 = self.0 << 2 | column as u32;
+    }
+}
 
 #[inline(always)]
 fn nibble_at(within: impl Into<u64>, n: impl Into<u32>) -> u8 {
@@ -110,8 +189,6 @@ impl Stack {
     }
 }
 
-struct InitialTableaux([u64; 4]);
-
 #[derive(Clone, Copy, Default, Eq, Ord, PartialEq, PartialOrd)]
 struct Tableaux(u16);
 
@@ -130,11 +207,18 @@ impl Tableaux {
         }
         Tableaux(tableaux)
     }
+
+    fn distance_to(self, other: Self) -> u8 {
+        let diff = self.0 - other.0;
+        let halves = (diff & 0x0F0F) + ((diff >> 4) & 0x0F0F);
+        (halves + (halves >> 8)) as u8
+    }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Default)]
 struct Position {
     tableaux: Tableaux,
+    moves: Moves,
     stack: Stack,
     total: u8,
     score: u8,
@@ -166,13 +250,15 @@ impl Position {
             return None;
         }
         self.stack.push(card);
+        self.moves.push(column);
         Some(self)
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 struct BestStack {
     score: u16,
+    moves: Moves,
     tableaux: Tableaux,
 }
 
@@ -294,6 +380,7 @@ impl StackCache {
             self.cache
                 .extend(self.done.drain(..).map(|position| BestStack {
                     score: position.score.into(),
+                    moves: position.moves,
                     tableaux: position.tableaux,
                 }));
             range.end = self.cache.len().try_into().unwrap();
@@ -320,6 +407,7 @@ impl SearchState {
         let start = Tableaux::new(&initial);
         best[usize::from(start.0)] = BestStack {
             score: 1,
+            moves: Moves(0),
             tableaux: start,
         };
         // once the piles are empty, there are no moves to make
@@ -334,7 +422,8 @@ impl SearchState {
     fn search(&mut self) -> u16 {
         let mut edges = 0;
         let mut leaves = 0;
-        let mut todo = vec![Tableaux::new(&self.initial)];
+        let start = Tableaux::new(&self.initial);
+        let mut todo = vec![start];
         let mut max_todo = todo.len();
         while let Some(cur) = todo.pop() {
             let cur_best = self.best[usize::from(cur.0)].score;
@@ -344,13 +433,19 @@ impl SearchState {
                 }
                 let new_score = cur_best + next.score;
                 if new_score > self.best[usize::from(next.tableaux.0)].score {
-                    if next.tableaux == Tableaux::default() {
-                        eprintln!(" *** HIGH SCORE {}", new_score - 1);
-                    }
                     self.best[usize::from(next.tableaux.0)] = BestStack {
                         score: new_score,
+                        moves: next.moves,
                         tableaux: cur,
                     };
+                    if next.tableaux == Tableaux::default() {
+                        eprint!(" *** HIGH SCORE {}: ", new_score - 1);
+                        let path = best_path(self.best.as_slice(), start, next.tableaux);
+                        for (width, moves, _result) in path.iter() {
+                            eprint!("{moves:width$?}_", width = *width as usize);
+                        }
+                        eprintln!();
+                    }
                     todo.push(next.tableaux);
                     edges += 1;
                 }
@@ -375,8 +470,26 @@ impl SearchState {
     }
 }
 
+fn best_path(bests: &[BestStack], from: Tableaux, mut to: Tableaux) -> Vec<(u8, Moves, Tableaux)> {
+    let mut path = Vec::new();
+    while to < from {
+        let best = bests[usize::from(to.0)];
+        let width = best.tableaux.distance_to(to);
+        path.push((width, best.moves, to));
+        to = best.tableaux;
+    }
+    path.reverse();
+    path
+}
+
 fn main() {
-    let initial = InitialTableaux([0xdcba987654321; 4]);
-    let score = SearchState::new(initial).search();
-    println!("{score}");
+    for (i, spec) in std::env::args().enumerate().skip(1) {
+        match spec.parse() {
+            Ok(initial) => {
+                let mut search_state = SearchState::new(initial);
+                search_state.search();
+            }
+            Err(err) => eprintln!("bad spec {i} ({spec}): {err}"),
+        }
+    }
 }
