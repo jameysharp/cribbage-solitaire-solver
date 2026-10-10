@@ -223,6 +223,9 @@ impl StackCache {
             ..Position::default()
         });
         while !self.todo.is_empty() {
+            let key = |position: &Position| (position.tableaux, position.stack);
+            debug_assert!(self.todo.iter().is_sorted_by_key(key));
+
             // we're keeping self.todo sorted and unique by tableaux then stack.
             // move_from preserves that sort order and uniqueness if given
             // the same column number every time: it subtracts a constant from
@@ -231,7 +234,6 @@ impl StackCache {
             // lists, which can be merged and deduplicated in linear time.
             let mut nexts: [_; 4] = std::array::from_fn(|_| self.todo.iter());
             self.next.extend(std::iter::from_fn(move || {
-                let key = |position: Position| (position.tableaux, position.stack);
                 let mut min = Position::default();
                 let mut min_idx = None;
                 // in one visit to each column, find the minimum legal move
@@ -240,7 +242,7 @@ impl StackCache {
                     while let Some(position) = idx.as_slice().first() {
                         // recompute move_from every time, it's cheap
                         if let Some(next) = position.move_from(initial, column as u8) {
-                            match (&min_idx, key(next).cmp(&key(min))) {
+                            match (&min_idx, key(&next).cmp(&key(&min))) {
                                 (None, _) | (_, Ordering::Less) => {
                                     min = next;
                                     min_idx = Some(idx);
