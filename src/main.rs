@@ -301,7 +301,39 @@ fn best_dedup(mut iter: impl Iterator<Item = Position>) -> impl Iterator<Item = 
     })
 }
 
+struct Pending<'a> {
+    next: Position,
+    rest: std::slice::Iter<'a, Position>,
+}
+
+impl<'a> Pending<'a> {
+    fn new(
+        mut rest: std::slice::Iter<'a, Position>,
+        initial: &InitialTableaux,
+        column: usize,
+    ) -> Self {
+        let mut next = Position::default();
+        while let Some(position) = rest.next() {
+            if let Some(found) = position.move_from(initial, column as u8) {
+                next = found;
+                debug_assert!(next.stack != Stack::default());
+                break;
+            }
+        }
+        Self { next, rest }
+    }
+
+    fn peek(&self) -> Option<Position> {
+        (self.next.stack != Stack::default()).then_some(self.next)
+    }
+
+    fn next(&mut self, initial: &InitialTableaux, column: usize) {
+        *self = Self::new(self.rest.clone(), initial, column);
+    }
+}
+
 impl StackCache {
+    #[inline(never)]
     fn uncached(&mut self, initial: &InitialTableaux, tableaux: Tableaux) {
         let level = Level::new();
         self.todo.push(Position {
@@ -318,41 +350,40 @@ impl StackCache {
             // tableaux, and inserts a nibble at the bottom of stack. so if we
             // generate moves for each column separately, we have four sorted
             // lists, which can be merged and deduplicated in linear time.
-            let mut nexts: [_; 4] = std::array::from_fn(|_| self.todo.iter());
-            self.next.extend(std::iter::from_fn(move || {
+            let mut nexts: [_; 4] =
+                std::array::from_fn(|column| Pending::new(self.todo.iter(), initial, column));
+            loop {
                 let mut min = Position::default();
-                let mut min_idx = None;
+                let mut min_column = None;
                 // in one visit to each column, find the minimum legal move
                 // and, at the same time, deduplicate moves
-                for (column, idx) in nexts.iter_mut().enumerate() {
-                    while let Some(position) = idx.as_slice().first() {
-                        // recompute move_from every time, it's cheap
-                        if let Some(next) = position.move_from(initial, column as u8) {
-                            match (&min_idx, key(&next).cmp(&key(&min))) {
-                                (None, _) | (_, Ordering::Less) => {
-                                    min = next;
-                                    min_idx = Some(idx);
-                                }
-                                // it doesn't matter if the current min
-                                // doesn't turn out to be the final min; if
-                                // there are two equal positions we'll want
-                                // to get rid of one sooner or later
-                                (_, Ordering::Equal) => {
-                                    idx.next();
-                                }
-                                (_, Ordering::Greater) => {}
+                for (column, pending) in nexts.iter_mut().enumerate() {
+                    if let Some(next) = pending.peek() {
+                        match (&min_column, key(&next).cmp(&key(&min))) {
+                            (None, _) | (_, Ordering::Less) => {
+                                min = next;
+                                min_column = Some(column);
                             }
-                            break;
+                            // it doesn't matter if the current min
+                            // doesn't turn out to be the final min; if
+                            // there are two equal positions we'll want
+                            // to get rid of one sooner or later
+                            (_, Ordering::Equal) => {
+                                pending.next(initial, column);
+                            }
+                            (_, Ordering::Greater) => {}
                         }
-                        // no move from this position in this column, skip
-                        idx.next();
                     }
                 }
                 // if we found any move, return it but skip it next time
-                min_idx?.next();
-                min.update_score(level);
-                Some(min)
-            }));
+                if let Some(column) = min_column {
+                    nexts[column].next(initial, column);
+                    min.update_score(level);
+                    self.next.push(min);
+                } else {
+                    break;
+                }
+            }
 
             self.done
                 .extend(best_dedup(self.todo.drain(..).filter(|position| {
