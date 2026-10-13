@@ -11,26 +11,25 @@ use fearless_simd::{Level, Simd, dispatch, i16x8, u8x16, u16x8, u64x2};
 use fearless_simd_macros::simd;
 
 #[derive(Debug)]
-struct InitialTableaux([u64; 4]);
+struct InitialTableaux([[u8; 16]; 4]);
 
 impl std::str::FromStr for InitialTableaux {
     type Err = &'static str;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let push = |pile: &mut u64, card| {
-            *pile >>= 4;
-            *pile |= (card as u64) << 60;
+        let push = |pile: &mut [u8; 16], card| {
+            let height = pile[15].min(13) + 1;
+            pile[usize::from(height)] = card as u8;
+            pile[15] = height;
         };
-        let finish = |pile: &mut u64| {
-            let empty = pile.trailing_zeros() / 4;
-            *pile >>= empty * 4;
-            if empty < 3 {
+        let finish = |pile: &mut [u8; 16]| {
+            if pile[15] > 13 {
                 Err("too many cards in pile")
             } else {
                 Ok(())
             }
         };
-        let mut result = [0; _];
+        let mut result = [[0; _]; _];
         let (mut pile, mut rest) = result.split_first_mut().unwrap();
         for c in s.chars() {
             match c {
@@ -202,7 +201,7 @@ impl Tableaux {
     fn new(initial: &InitialTableaux) -> Tableaux {
         let mut tableaux = 0;
         for (column, contents) in initial.0.iter().enumerate() {
-            let height = 16 - contents.leading_zeros() as u16 / 4;
+            let height = contents[15] as u16;
             tableaux |= height << column * 4;
         }
         Tableaux(tableaux)
@@ -238,13 +237,13 @@ impl Position {
     }
 
     fn move_from(mut self, initial: &InitialTableaux, column: u8) -> Option<Self> {
-        if nibble_at(self.tableaux.0, column) == 0 {
+        let offset = nibble_at(self.tableaux.0, column);
+        if offset == 0 {
             // underflow, no cards left in this column
             return None;
         }
         self.tableaux.0 = self.tableaux.0.wrapping_sub(1 << column * 4);
-        let offset = nibble_at(self.tableaux.0, column);
-        let card = nibble_at(initial.0[usize::from(column)], offset);
+        let card = initial.0[usize::from(column)][usize::from(offset)];
         self.total += card.min(10);
         if self.total > 31 {
             return None;
