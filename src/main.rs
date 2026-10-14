@@ -207,6 +207,14 @@ impl Tableaux {
         Tableaux(tableaux)
     }
 
+    fn next_cards(self, initial: &InitialTableaux) -> [u8; 4] {
+        // InitialTableaux puts the "no card" sentinel, 0, in position 0, so
+        // this doesn't need to check if the pile is empty
+        std::array::from_fn(|column| {
+            initial.0[column][usize::from(nibble_at(self.0, column as u8))]
+        })
+    }
+
     fn distance_to(self, other: Self) -> u8 {
         let diff = self.0 - other.0;
         let halves = (diff & 0x0F0F) + ((diff >> 4) & 0x0F0F);
@@ -217,10 +225,11 @@ impl Tableaux {
 #[derive(Clone, Copy, Default)]
 struct Position {
     tableaux: Tableaux,
-    moves: Moves,
     stack: Stack,
+    next_cards: [u8; 4],
     total: u8,
     score: u8,
+    moves: Moves,
 }
 
 impl Position {
@@ -234,23 +243,6 @@ impl Position {
         self.score += self.stack.score_first_jack();
         self.score += self.stack.score_repeats();
         self.score += dispatch!(level, simd => self.stack.score_run_simd(simd));
-    }
-
-    fn move_from(mut self, initial: &InitialTableaux, column: u8) -> Option<Self> {
-        let offset = nibble_at(self.tableaux.0, column);
-        if offset == 0 {
-            // underflow, no cards left in this column
-            return None;
-        }
-        self.tableaux.0 = self.tableaux.0.wrapping_sub(1 << column * 4);
-        let card = initial.0[usize::from(column)][usize::from(offset)];
-        self.total += card.min(10);
-        if self.total > 31 {
-            return None;
-        }
-        self.stack.push(card);
-        self.moves.push(column);
-        Some(self)
     }
 }
 
@@ -284,33 +276,27 @@ impl Default for StackCache {
 }
 
 struct Pending<'a> {
-    next: Position,
     rest: std::slice::Iter<'a, Position>,
 }
 
 impl<'a> Pending<'a> {
-    fn new(
-        mut rest: std::slice::Iter<'a, Position>,
-        initial: &InitialTableaux,
-        column: usize,
-    ) -> Self {
-        let mut next = Position::default();
-        while let Some(position) = rest.next() {
-            if let Some(found) = position.move_from(initial, column as u8) {
-                next = found;
-                debug_assert!(next.stack != Stack::default());
+    fn new(mut rest: std::slice::Iter<'a, Position>, column: usize) -> Self {
+        while let Some(position) = rest.as_slice().first() {
+            if position.next_cards[column] != 0 {
                 break;
             }
+            rest.next();
         }
-        Self { next, rest }
+        Self { rest }
     }
 
     fn peek(&self) -> Option<Position> {
-        (self.next.stack != Stack::default()).then_some(self.next)
+        self.rest.as_slice().first().cloned()
     }
 
-    fn next(&mut self, initial: &InitialTableaux, column: usize) {
-        *self = Self::new(self.rest.clone(), initial, column);
+    fn next(&mut self, column: usize) {
+        self.rest.next();
+        *self = Self::new(self.rest.clone(), column);
     }
 }
 
@@ -320,6 +306,7 @@ impl StackCache {
         let level = Level::new();
         self.todo.push(Position {
             tableaux,
+            next_cards: tableaux.next_cards(initial),
             ..Position::default()
         });
         while !self.todo.is_empty() {
@@ -333,14 +320,17 @@ impl StackCache {
             // generate moves for each column separately, we have four sorted
             // lists, which can be merged and deduplicated in linear time.
             let mut nexts: [_; 4] =
-                std::array::from_fn(|column| Pending::new(self.todo.iter(), initial, column));
+                std::array::from_fn(|column| Pending::new(self.todo.iter(), column));
             loop {
                 let mut min = Position::default();
                 let mut min_column = None;
                 // in one visit to each column, find the minimum legal move
                 // and, at the same time, deduplicate moves
                 for (column, pending) in nexts.iter_mut().enumerate() {
-                    if let Some(next) = pending.peek() {
+                    if let Some(mut next) = pending.peek() {
+                        // update only the key fields; defer the rest
+                        next.tableaux.0 -= 1 << column * 4;
+                        next.stack.push(next.next_cards[column]);
                         match (&min_column, key(&next).cmp(&key(&min))) {
                             (None, _) | (_, Ordering::Less) => {
                                 min = next;
@@ -351,7 +341,7 @@ impl StackCache {
                             // there are two equal positions we'll want
                             // to get rid of one sooner or later
                             (_, Ordering::Equal) => {
-                                pending.next(initial, column);
+                                pending.next(column);
                             }
                             (_, Ordering::Greater) => {}
                         }
@@ -360,11 +350,30 @@ impl StackCache {
 
                 // if we found any move, return it but skip it next time
                 let Some(column) = min_column else { break };
-                nexts[column].next(initial, column);
+                nexts[column].next(column);
 
+                // now update the remaining non-key fields
+                min.total += min.next_cards[column].min(10);
                 min.update_score(level);
+                min.moves.push(column as u8);
 
-                if (0..4).any(|column| min.move_from(initial, column).is_some()) {
+                // NB: LLVM generates much better code if next_cards is only
+                // updated all at once, because then it can store it in one
+                // 32-bit write instruction. the check below for whether all
+                // cards are zero is emitted as a 32-bit load instruction as
+                // well. on x86, if the same memory location is loaded at a
+                // different width than it was recently stored at, the CPU
+                // takes a huge performance hit when it realizes that the value
+                // it needs was still in the store forwarding buffer. so doing
+                // byte-wide writes here would make that next load very slow.
+                min.next_cards = min.tableaux.next_cards(initial);
+                if min.total > 21 {
+                    min.next_cards = min
+                        .next_cards
+                        .map(|card| if card <= 31 - min.total { card } else { 0 });
+                }
+
+                if min.next_cards != [0; 4] {
                     self.next.push(min);
                     continue;
                 }
