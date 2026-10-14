@@ -283,23 +283,6 @@ impl Default for StackCache {
     }
 }
 
-fn best_dedup(mut iter: impl Iterator<Item = Position>) -> impl Iterator<Item = Position> {
-    let mut next = iter.next();
-    std::iter::from_fn(move || {
-        let mut a = next.take()?;
-        while let Some(b) = iter.next() {
-            if a.tableaux != b.tableaux {
-                next = Some(b);
-                break;
-            }
-            if a.score < b.score {
-                a = b;
-            }
-        }
-        Some(a)
-    })
-}
-
 struct Pending<'a> {
     next: Position,
     rest: std::slice::Iter<'a, Position>,
@@ -374,21 +357,29 @@ impl StackCache {
                         }
                     }
                 }
+
                 // if we found any move, return it but skip it next time
-                if let Some(column) = min_column {
-                    nexts[column].next(initial, column);
-                    min.update_score(level);
+                let Some(column) = min_column else { break };
+                nexts[column].next(initial, column);
+
+                min.update_score(level);
+
+                if (0..4).any(|column| min.move_from(initial, column).is_some()) {
                     self.next.push(min);
-                } else {
-                    break;
+                    continue;
+                }
+
+                match self.done.last_mut() {
+                    Some(prev) if prev.tableaux == min.tableaux => {
+                        if prev.score < min.score {
+                            *prev = min;
+                        }
+                    }
+                    _ => self.done.push(min),
                 }
             }
 
-            self.done
-                .extend(best_dedup(self.todo.drain(..).filter(|position| {
-                    (0..4).all(|column| position.move_from(initial, column).is_none())
-                })));
-
+            self.todo.clear();
             std::mem::swap(&mut self.todo, &mut self.next);
         }
 
