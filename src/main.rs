@@ -82,8 +82,8 @@ impl std::fmt::Debug for Moves {
 }
 
 impl Moves {
-    fn push(&mut self, column: u8) {
-        self.0 = self.0 << 2 | column as u32;
+    fn push(self, column: u8) -> Moves {
+        Moves(self.0 << 2 | column as u32)
     }
 }
 
@@ -102,8 +102,8 @@ impl std::fmt::Debug for Stack {
 }
 
 impl Stack {
-    fn push(&mut self, card: u8) {
-        self.0 = self.0 << 4 | card as u64;
+    fn push(self, card: u8) -> Stack {
+        Stack(self.0 << 4 | card as u64)
     }
 
     fn score_first_jack(self) -> u8 {
@@ -207,6 +207,10 @@ impl Tableaux {
         Tableaux(tableaux)
     }
 
+    fn decrement(self, column: usize) -> Tableaux {
+        Tableaux(self.0 - (1 << column * 4))
+    }
+
     fn next_cards(self, initial: &InitialTableaux) -> [u8; 4] {
         // InitialTableaux puts the "no card" sentinel, 0, in position 0, so
         // this doesn't need to check if the pile is empty
@@ -230,20 +234,6 @@ struct Position {
     total: u8,
     score: u8,
     moves: Moves,
-}
-
-impl Position {
-    fn score_total(&self) -> u8 {
-        if self.total & 0xF == 0xF { 2 } else { 0 }
-    }
-
-    #[inline]
-    fn update_score(&mut self, level: Level) {
-        self.score += self.score_total();
-        self.score += self.stack.score_first_jack();
-        self.score += self.stack.score_repeats();
-        self.score += dispatch!(level, simd => self.stack.score_run_simd(simd));
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -290,13 +280,14 @@ impl<'a> Pending<'a> {
         Self { rest }
     }
 
-    fn peek(&self) -> Option<Position> {
-        self.rest.as_slice().first().cloned()
+    fn peek(&self) -> Option<&Position> {
+        self.rest.as_slice().first()
     }
 
-    fn next(&mut self, column: usize) {
-        self.rest.next();
+    fn next(&mut self, column: usize) -> &Position {
+        let result = self.rest.next().unwrap();
         *self = Self::new(self.rest.clone(), column);
+        result
     }
 }
 
@@ -310,9 +301,6 @@ impl StackCache {
             ..Position::default()
         });
         while !self.todo.is_empty() {
-            let key = |position: &Position| (position.tableaux, position.stack);
-            debug_assert!(self.todo.iter().is_sorted_by_key(key));
-
             // we're keeping self.todo sorted and unique by tableaux then stack.
             // move_from preserves that sort order and uniqueness if given
             // the same column number every time: it subtracts a constant from
@@ -322,18 +310,20 @@ impl StackCache {
             let mut nexts: [_; 4] =
                 std::array::from_fn(|column| Pending::new(self.todo.iter(), column));
             loop {
-                let mut min = Position::default();
+                let mut min_key = Default::default();
                 let mut min_column = None;
                 // in one visit to each column, find the minimum legal move
                 // and, at the same time, deduplicate moves
                 for (column, pending) in nexts.iter_mut().enumerate() {
-                    if let Some(mut next) = pending.peek() {
+                    if let Some(next) = pending.peek() {
                         // update only the key fields; defer the rest
-                        next.tableaux.0 -= 1 << column * 4;
-                        next.stack.push(next.next_cards[column]);
-                        match (&min_column, key(&next).cmp(&key(&min))) {
+                        let next_key = (
+                            next.tableaux.decrement(column),
+                            next.stack.push(next.next_cards[column]),
+                        );
+                        match (&min_column, next_key.cmp(&min_key)) {
                             (None, _) | (_, Ordering::Less) => {
-                                min = next;
+                                min_key = next_key;
                                 min_column = Some(column);
                             }
                             // it doesn't matter if the current min
@@ -350,12 +340,18 @@ impl StackCache {
 
                 // if we found any move, return it but skip it next time
                 let Some(column) = min_column else { break };
-                nexts[column].next(column);
+                let next = nexts[column].next(column);
 
                 // now update the remaining non-key fields
-                min.total += min.next_cards[column].min(10);
-                min.update_score(level);
-                min.moves.push(column as u8);
+                let tableaux = min_key.0;
+                let stack = min_key.1;
+                let total = next.total + next.next_cards[column].min(10);
+                let score = next.score
+                    + if total & 0xF == 0xF { 2 } else { 0 }
+                    + stack.score_first_jack()
+                    + stack.score_repeats()
+                    + dispatch!(level, simd => stack.score_run_simd(simd));
+                let moves = next.moves.push(column as u8);
 
                 // NB: LLVM generates much better code if next_cards is only
                 // updated all at once, because then it can store it in one
@@ -366,7 +362,7 @@ impl StackCache {
                 // takes a huge performance hit when it realizes that the value
                 // it needs was still in the store forwarding buffer. so doing
                 // byte-wide writes here would make that next load very slow.
-                min.next_cards = min.tableaux.next_cards(initial);
+                let mut next_cards = tableaux.next_cards(initial);
 
                 // the maximum value of a card is 10, and if the stack total
                 // was 21 or less, adding 10 can't make it exceed the limit of
@@ -380,15 +376,24 @@ impl StackCache {
                 // without overflowing into the next card, then spread bit 5 in
                 // each card into a mask indicating which cards would exceed the
                 // stack limit.
-                if min.total > 21 {
-                    let next_cards = u32::from_ne_bytes(min.next_cards);
-                    let over = next_cards + min.total as u32 * 0x01010101;
+                if total > 21 {
+                    let cards = u32::from_ne_bytes(next_cards);
+                    let over = cards + total as u32 * 0x01010101;
                     let to_clear = 0xFF * ((over >> 5) & 0x01010101);
-                    let cleared = next_cards & !to_clear;
-                    min.next_cards = cleared.to_ne_bytes();
+                    let cleared = cards & !to_clear;
+                    next_cards = cleared.to_ne_bytes();
                 }
 
-                if min.next_cards != [0; 4] {
+                let min = Position {
+                    tableaux,
+                    stack,
+                    next_cards,
+                    total,
+                    score,
+                    moves,
+                };
+
+                if next_cards != [0; 4] {
                     self.next.push(min);
                     continue;
                 }
