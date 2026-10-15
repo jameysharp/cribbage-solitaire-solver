@@ -367,10 +367,25 @@ impl StackCache {
                 // it needs was still in the store forwarding buffer. so doing
                 // byte-wide writes here would make that next load very slow.
                 min.next_cards = min.tableaux.next_cards(initial);
+
+                // the maximum value of a card is 10, and if the stack total
+                // was 21 or less, adding 10 can't make it exceed the limit of
+                // 31. past 21, anything of rank 10 or higher will definitely
+                // exceed the stack limit, so we can check the card rank instead
+                // of its value, avoiding computing `card.min(10)`. this means
+                // we only need to add the total to each card and see if the sum
+                // exceeds 31. conveniently, that't the same as checking if the
+                // sum overflowed into bit 5, and the cards have padding bits
+                // between them, so we can add the total to all cards at once
+                // without overflowing into the next card, then spread bit 5 in
+                // each card into a mask indicating which cards would exceed the
+                // stack limit.
                 if min.total > 21 {
-                    min.next_cards = min
-                        .next_cards
-                        .map(|card| if card <= 31 - min.total { card } else { 0 });
+                    let next_cards = u32::from_ne_bytes(min.next_cards);
+                    let over = next_cards + min.total as u32 * 0x01010101;
+                    let to_clear = 0xFF * ((over >> 5) & 0x01010101);
+                    let cleared = next_cards & !to_clear;
+                    min.next_cards = cleared.to_ne_bytes();
                 }
 
                 if min.next_cards != [0; 4] {
